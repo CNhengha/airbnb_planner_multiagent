@@ -2,12 +2,13 @@
 import asyncio
 import json
 import os
+import sys
 import uuid
-
+from google.genai import types
 from typing import Any
-
+from google.adk.runners import Runner
 import httpx
-
+from types import SimpleNamespace
 from a2a.client import A2ACardResolver
 from a2a.types import (
     AgentCard,
@@ -27,10 +28,14 @@ from remote_agent_connection import (
     RemoteAgentConnections,
     TaskUpdateCallback,
 )
-
-
+from a2a.types import Task, Message, Part, TextPart
 load_dotenv()
-
+from google import genai
+try:
+    from airbnb_planner_multiagent.routing.routing_agent import RoutingAgent as routing
+except ImportError:
+    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+    from routing.routing_agent import RoutingAgent as routing
 
 def convert_part(part: Part, tool_context: ToolContext):
     """Convert a part to text. Only text parts are supported."""
@@ -66,8 +71,6 @@ def create_send_message_payload(
     if context_id:
         payload['message']['contextId'] = context_id
     return payload
-
-
 class RoutingAgent:
     """The Routing agent.
 
@@ -85,40 +88,34 @@ class RoutingAgent:
         self.agents: str = ''
 
     async def _async_init_components(
-        self, remote_agent_addresses: list[str]
+        self,
+        remote_agent_addresses: list[str],
+        agent_names: list[str],
     ) -> None:
-        """Asynchronous part of initialization."""
-        # Use a single httpx.AsyncClient for all card resolutions for efficiency
-        # Increase timeout to 300 seconds (5 minutes) for agent card resolution
-        async with httpx.AsyncClient(timeout=300.0, trust_env=False) as client:
-            for address in remote_agent_addresses:
-                card_resolver = A2ACardResolver(
-                    client, address
-                )  # Constructor is sync
-                try:
-                    card = (
-                        await card_resolver.get_agent_card()
-                    )  # get_agent_card is async
+        """Initialize connections to remote agents (no card fetching, use agent names)."""
+        for agent_name, address in zip(agent_names, remote_agent_addresses):
+            if agent_name in self.remote_agent_connections:
+                continue
+            try:
+                # 创建 RemoteAgentConnections 实例（不读取 agent card）
+                remote_connection = RemoteAgentConnections(
+                    agent_card=None,  # 不加载
+                    agent_url=address
+                )
 
-                    remote_connection = RemoteAgentConnections(
-                        agent_card=card, agent_url=address
-                    )
-                    self.remote_agent_connections[card.name] = remote_connection
-                    self.cards[card.name] = card
-                except httpx.ConnectError as e:
-                    print(
-                        f'ERROR: Failed to get agent card from {address}: {e}'
-                    )
-                except Exception as e:  # Catch other potential errors
-                    print(
-                        f'ERROR: Failed to initialize connection for {address}: {e}'
-                    )
+                # 用 agent_name 作为 key（替代原来的 URL）
+                self.remote_agent_connections[agent_name] = remote_connection
 
-        # Populate self.agents using the logic from original __init__ (via list_remote_agents)
-        agent_info = []
-        for agent_detail_dict in self.list_remote_agents():
-            agent_info.append(json.dumps(agent_detail_dict))
-        self.agents = '\n'.join(agent_info)
+                print(f"[RoutingAgent] 🔗 Connected (no-card) to {agent_name} @ {address}")
+
+            except Exception as e:
+                print(f"[RoutingAgent] ❌ Failed to connect to {agent_name} @ {address}: {e}")
+
+        # 记录连接信息（仅作调试用途）
+        self.agents = "\n".join(
+            [f"{{'name': '{name}', 'url': '{url}'}}" for name, url in zip(agent_names, remote_agent_addresses)]
+        )
+
 
     @classmethod
     async def create(
@@ -128,7 +125,8 @@ class RoutingAgent:
     ) -> 'RoutingAgent':
         """Create and asynchronously initialize an instance of the RoutingAgent."""
         instance = cls(task_callback)
-        await instance._async_init_components(remote_agent_addresses)
+        instance.remote_agent_connections = {}
+        instance.cards = {}
         return instance
 
     def create_agent(self) -> Agent:
@@ -150,7 +148,7 @@ class RoutingAgent:
         """Generate the root instruction for the RoutingAgent."""
         current_agent = self.check_active_agent(context)
         return f"""
-        **Role:** You are an expert Routing Delegator. Your primary function is to accurately delegate user inquiries regarding weather, accommodations, or TripAdvisor searches to the appropriate specialized remote agents.
+        **Role:** You are an expert Routing Delegator. Your primary function is to accurately delegate user inquiries regarding Weather, Accommodations,TripAdvisor,Location or Transport searches to the appropriate specialized remote agents.
 
         **Core Directives:**
 
@@ -164,10 +162,17 @@ class RoutingAgent:
         * **Tool Reliance:** Strictly rely on available tools to address user requests. Do not generate responses based on assumptions. If         information is insufficient, request clarification from the user.
         * **Prioritize Recent Interaction:** Focus primarily on the most recent parts of the conversation when processing requests.
         * **Active Agent Prioritization:** If an active agent is already engaged, route subsequent related requests to that agent using the         appropriate task update tool.
-
+        * **Keyword Selection:** 
+          Instead of specifying an agent name, you MUST include a `keyword` argument in your function call.
+          The keyword MUST be selected from the following list:  
+          - `"Weather"` → for any question related to climate, temperature, or forecasts  
+          - `"Accommodations"` → for accommodation, rooms, stays, or booking requests  
+          - `"TripAdvisor"` → for reviews, sightseeing, attractions, or travel planning
+          - `"Location"` → for questions involving specific places, addresses, or geographic information 
+          - `"Transport"` → for inquiries about transportation options, routes, schedules, or travel methods
         **Agent Roster:**
 
-        * Available Agents: `{self.agents}`
+        **Keyword Set:** ["Weather"," Accommodations"," TripAdvisor","Location","Transport"]
         * Currently Active Seller Agent: `{current_agent['active_agent']}`
                 """
 
@@ -204,81 +209,153 @@ class RoutingAgent:
                 {'name': card.name, 'description': card.description}
             )
         return remote_agent_info
+    
+    async def _connect_to_registry_(self, keyword: str, task: str, topk: int):
+        router = routing()  # ✅ 创建 RoutingAgent 实例
+        topk_list = await router.resolve_client(keyword, task, topk)
+
+        # 2️⃣ 解包成两个列表
+        agent_names = [a[0] for a in topk_list]
+        agent_urls = [a[1] for a in topk_list]
+
+        # 3️⃣ 打印信息
+        print(f"[Registry] Keyword='{keyword}' → Found {len(topk_list)} agents:")
+        for name, url in topk_list:
+            print(f"  - {name} @ {url}")
+
+    # ✅ 返回 (全部agent名, 全部URL, 完整列表)
+        return agent_names, agent_urls, topk_list
 
     async def send_message(
-        self, agent_name: str, task: str, tool_context: ToolContext
+        self, keyword: str, task:str, tool_context: ToolContext
     ):
-        """Sends a task to remote seller agent.
+        topk=3
+        """Send a task to dynamically discovered agents.
 
-        This will send a message to the remote agent named agent_name.
-
-        Args:
-            agent_name: The name of the agent to send the task to.
-            task: The comprehensive conversation context summary
-                and goal to be achieved regarding user inquiry and purchase request.
-            tool_context: The tool context this method runs in.
-
-        Yields:
-            A dictionary of JSON data.
+        Dynamically connects to agents returned by the registry,
+        and sends the user's request to them concurrently.
         """
-        if agent_name not in self.remote_agent_connections:
-            raise ValueError(f'Agent {agent_name} not found')
         state = tool_context.state
-        state['active_agent'] = agent_name
-        client = self.remote_agent_connections[agent_name]
 
-        if not client:
-            raise ValueError(f'Client not available for {agent_name}')
-        # task_id = state['task_id'] if 'task_id' in state else str(uuid.uuid4())
+        # 1️⃣ 向注册中心请求 agent 列表
+        agent_names, agent_urls, topk_list = await self._connect_to_registry_(keyword,task,topk)
+        state["active_agent"] = agent_names
+        state["registry_candidates"] = topk_list
 
-        if 'context_id' in state:
-            context_id = state['context_id']
-        else:
-            context_id = str(uuid.uuid4())
+        # 2️⃣ 懒连接：仅连接尚未建立的 URL
+        for url in agent_urls:
+            await self._async_init_components(agent_urls,agent_names)
 
-        message_id = ''
-        metadata = {}
-        if 'input_message_metadata' in state:
-            metadata.update(**state['input_message_metadata'])
-            if 'message_id' in state['input_message_metadata']:
-                message_id = state['input_message_metadata']['message_id']
-        if not message_id:
-            message_id = str(uuid.uuid4())
+        # 3️⃣ 构造消息 payload
+        context_id = state.get("context_id", str(uuid.uuid4()))
+        input_metadata = state.get("input_message_metadata", {})
+        message_id = input_metadata.get("message_id", str(uuid.uuid4()))
 
         payload = {
-            'message': {
-                'role': 'user',
-                'parts': [
-                    {'type': 'text', 'text': task}
-                ],  # Use the 'task' argument here
-                'messageId': message_id,
-            },
+            "message": {
+                "role": "user",
+                "parts": [{"type": "text", "text": task}],
+                "messageId": message_id,
+                "contextId": context_id,
+            }
         }
-        
-        # Don't send taskId to remote agents - let them create their own tasks
-        # Remote agents should create new tasks, not try to find existing unknown task IDs
-
-        if context_id:
-            payload['message']['contextId'] = context_id
-
+        pretty_payload = json.dumps(payload, indent=4, ensure_ascii=False)
+        print("\n==============================")
+        print(f"[RoutingAgent] 📤 Sending payload to child agents ({keyword}):")
+        print(pretty_payload)
+        print("==============================\n")
         message_request = SendMessageRequest(
             id=message_id, params=MessageSendParams.model_validate(payload)
         )
-        send_response: SendMessageResponse = await client.send_message(
-            message_request=message_request
-        )
-        # Skip printing response to avoid encoding errors on Windows
-        # print('send_response', send_response.model_dump_json(exclude_none=True, indent=2))
 
-        if not isinstance(send_response.root, SendMessageSuccessResponse):
-            print('received non-success response. Aborting get task ')
-            return None
+        # 4️⃣ 定义子任务：并发访问每个 agent
+        async def query_agent(agent_name: str):
+            from a2a.types import SendMessageSuccessResponse, Task, SendMessageResponse
 
-        if not isinstance(send_response.root.result, Task):
-            print('received non-task response. Aborting get task ')
-            return None
+            client = self.remote_agent_connections.get(agent_name)
+            if not client:
+                return agent_name, {"error": f"No active connection for {agent_name}"}
 
-        return send_response.root.result
+            try:
+                send_response = await client.send_message(message_request=message_request)
+
+                # --- 三层兼容结构 ---
+                if isinstance(send_response, Task):
+                    return agent_name, send_response
+
+                elif isinstance(send_response, SendMessageResponse):
+                    if hasattr(send_response, "root") and isinstance(
+                        send_response.root, SendMessageSuccessResponse
+                    ):
+                        if isinstance(send_response.root.result, Task):
+                            return agent_name, send_response.root.result
+                        else:
+                            return agent_name, {
+                                "error": "SendMessageSuccessResponse has no Task result"
+                            }
+                    else:
+                        return agent_name, {
+                            "error": f"Unexpected SendMessageResponse root type: {type(getattr(send_response, 'root', None))}"
+                        }
+
+                elif isinstance(send_response, dict):
+                    return agent_name, send_response
+
+                else:
+                    return agent_name, {"error": f"Unknown response type: {type(send_response)}"}
+
+            except Exception as e:
+                print(f"[RoutingAgent] ❌ Error calling {agent_name}: {e}")
+                return agent_name, {"error": str(e)}
+
+        # 5️⃣ 并发执行所有子请求
+        results = await asyncio.gather(*(query_agent(name) for name in agent_names))
+
+        # 6️⃣ 聚合结果
+        responses = {}
+        for name, result in results:
+            if isinstance(result, Task):
+                text = None
+
+                # ✅ 优先从 artifacts 提取
+                if result.artifacts and len(result.artifacts) > 0:
+                    art = result.artifacts[0]
+                    if art.parts and len(art.parts) > 0:
+                        text = art.parts[0].root.text
+
+                # ✅ 若 artifacts 为空，再尝试从 history 提取
+                if not text and result.history:
+                    agent_msgs = [
+                        m for m in result.history if getattr(m, "role", None) == "agent"
+                    ]
+                    if agent_msgs and agent_msgs[-1].parts:
+                        text = agent_msgs[-1].parts[0].root.text
+
+                responses[name] = text or "(no text)"
+                print(
+                    f"[RoutingAgent] ✅ {name} responded successfully: {responses[name][:100]}..."
+                )
+                continue  # 🔹防止执行下面的 else
+
+            else:
+                responses[name] = result
+                print(f"[RoutingAgent] ⚠️ {name} returned non-task result: {result}")
+
+        # 7️⃣ （可选）过滤掉空文本的 agent
+        responses = {k: v for k, v in responses.items() if v and v != "(no text)"}
+        print(f"[RoutingAgent] ✅ Final aggregated Markdown output:\n{responses}")
+        combined_output = []
+        for text in responses.values():
+            if isinstance(text, str):
+                combined_output.append(text.strip())
+            elif isinstance(text, dict):
+                combined_output.append(str(text))  # 防止 strip 报错
+            else:
+                combined_output.append(repr(text))  # 兜底
+
+        final_text = "\n\n---\n\n".join(combined_output)
+        print(f"[RoutingAgent] 🧩 Combined text output:\n{final_text}")
+        return final_text
 
 
 def _get_initialized_routing_agent_sync() -> Agent:
@@ -287,9 +364,6 @@ def _get_initialized_routing_agent_sync() -> Agent:
     async def _async_main() -> Agent:
         routing_agent_instance = await RoutingAgent.create(
             remote_agent_addresses=[
-                os.getenv('AIR_AGENT_URL', 'http://localhost:10002'),
-                os.getenv('WEA_AGENT_URL', 'http://localhost:10001'),
-                os.getenv('TRIP_AGENT_URL', 'http://localhost:10003'),
             ]
         )
         return routing_agent_instance.create_agent()
