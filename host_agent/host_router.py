@@ -236,7 +236,7 @@ class HostRoutingAgent:
         return remote_agent_info
     
     async def _connect_to_registry_(self, keyword: str, task: str, topk: int):
-        router = RegistryRoutingAgent("http://localhost:8000/")  # 创建 Registry Agent
+        router = RegistryRoutingAgent(os.getenv("REGISTRY_BASE_URL"))  # 创建 Registry Agent
         topk_list,agent_list = await router.resolve_client(keyword, task, topk)
         agent_names = [a[0] for a in topk_list] 
         agent_urls = [a[1] for a in topk_list]
