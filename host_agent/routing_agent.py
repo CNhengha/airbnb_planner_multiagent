@@ -82,7 +82,7 @@ class RoutingAgent:
         # === 构造 agents_clean（去掉 score 和 agent_id），但保留其他字段 ===
         agents_clean: List[dict] = []
         for agent in agents_sorted[:k]:
-            clean = agent.model_dump(exclude={"score", "agent_id"})
+            clean = agent.model_dump(exclude={"agent_id"})
             agents_clean.append(clean)
 
         return results, agents_clean

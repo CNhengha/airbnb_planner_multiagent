@@ -2,12 +2,9 @@ import json
 import asyncio
 import traceback  # Import the traceback module
 import json
+import time
 import datetime
 import os
-os.environ["https_proxy"] = "http://127.0.0.1:8118"
-os.environ["http_proxy"] = "http://127.0.0.1:8118"
-os.environ["NO_PROXY"] = "localhost,127.0.0.1"
-os.environ["no_proxy"] = "localhost,127.0.0.1"
 from collections.abc import AsyncIterator
 from pprint import pformat
 import sys
@@ -25,13 +22,9 @@ def push_chat(role, text):
     return chat_history
 # 注册给插件
 register_chat_logger(push_chat)
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
-PARENT_DIR = os.path.dirname(PROJECT_ROOT)
-sys.path.insert(0, PARENT_DIR)
 from host_router import root_agent,host_agent_instance
 routing_agent = root_agent
-host_router = host_agent_instance       # HostRoutingAgent → 可加 debug_callback
+host_router = host_agent_instance       
 def host_debug_logger(text: str):
     host_router.debug_runtime_buffer.append(text)
 
@@ -46,7 +39,6 @@ ROUTING_AGENT_RUNNER = Runner(
     session_service=SESSION_SERVICE,
     plugins=[FunctionCallLogPlugin(name="function_call_logger")],
 )
-import json, os, time, datetime, traceback
 from pprint import pformat
 import gradio as gr
 from typing import AsyncIterator

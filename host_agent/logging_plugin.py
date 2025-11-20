@@ -18,7 +18,6 @@ def register_chat_logger(logger: Callable[[str, str], None]):
 class FunctionCallLogPlugin(BasePlugin):
 
     def __init__(self, name: str = "function_call_logger"):
-        # ⚠️ Google ADK 要求你必须传递 name 参数
         super().__init__(name=name)
 
     async def on_event(self, invocation_context, event: Event):
