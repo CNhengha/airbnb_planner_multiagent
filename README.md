@@ -10,7 +10,7 @@ This document describes a web application demonstrating the integration of Agent
 
 ## Architecture
 
-The application utilizes a multi-agent architecture where a host agent delegates tasks to remote agents (Airbnb and Weather) based on the user's query. These agents then interact with corresponding MCP servers.
+The application utilizes a multi-agent architecture where a host agent delegates tasks to remote agents based on the user's query. These agents then interact with corresponding MCP servers.
 
 ![architecture](assets/A2A_multi_agent.png)
 
@@ -29,41 +29,26 @@ Before running the application locally, ensure you have the following installed:
 3. **Python 3.13** Python 3.13 is required to run a2a-sdk
 4. **set up .env**
 
-- Create a `.env` file in `airbnb_agent` and `weather_agent` folder with the following content:
-
-    ```bash
-    GOOGLE_API_KEY="your_api_key_here" 
-    ```
-
 - Create `.env` file in `host_agent/` folder with the following content:
 
     ```bash
-    GOOGLE_GENAI_USE_VERTEXAI=TRUE
-    GOOGLE_CLOUD_PROJECT="your project"
-    GOOGLE_CLOUD_LOCATION=global
-    AIR_AGENT_URL=http://localhost:10002
-    WEA_AGENT_URL=http://localhost:10001
+    # For Gemini Developer API
+    GOOGLE_API_KEY="XXXXXX"
+  
+    # For Vertex AI
+    GOOGLE_GENAI_MODEL="XXXXX"
+    GOOGLE_GENAI_USE_VERTEXAI=True
+    GOOGLE_CLOUD_PROJECT="XXXXX"
+    GOOGLE_CLOUD_LOCATION="XXXX"
+    GOOGLE_APPLICATION_CREDENTIALS="XXXXX"
+  
+    # For Registry API
+    REGISTRY_BASE_URL=XXXXXX
+    API_KEY=XXXXXX
     ```
 
-## 1. Run Airbnb Agent
 
-Run the airbnb agent server:
-
-```bash
-cd samples/python/agents/airbnb_planner_multiagent/airbnb_agent
-uv run .
-```
-
-## 2. Run Weather Agent
-
-Open a new terminal and run the weather agent server:
-
-```bash
-cd samples/python/agents/airbnb_planner_multiagent/weather_agent
-uv run .
-```
-
-## 3. Run Host Agent
+## Run Host Agent
 
 Open a new terminal and run the host agent server
 
@@ -72,7 +57,7 @@ cd samples/python/agents/airbnb_planner_multiagent/host_agent
 uv run .
 ```
 
-## 4. Test at the UI
+## Test at the UI
 
 Here are example questions:
 
