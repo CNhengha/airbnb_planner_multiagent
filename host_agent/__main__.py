@@ -4,111 +4,165 @@ import traceback  # Import the traceback module
 import json
 import datetime
 import os
+os.environ["https_proxy"] = "http://127.0.0.1:8118"
+os.environ["http_proxy"] = "http://127.0.0.1:8118"
+os.environ["NO_PROXY"] = "localhost,127.0.0.1"
+os.environ["no_proxy"] = "localhost,127.0.0.1"
 from collections.abc import AsyncIterator
 from pprint import pformat
-
+import sys
 import gradio as gr
 
 from google.adk.events import Event
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
-from routing_agent import (
-    root_agent as routing_agent,
-)
+from gradio.chat_interface import ChatMessage
+from logging_plugin import FunctionCallLogPlugin, register_chat_logger
+chat_history = []
+def push_chat(role, text):
+    chat_history.append(ChatMessage(role=role, content=text))
+    return chat_history
+# 注册给插件
+register_chat_logger(push_chat)
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
+PARENT_DIR = os.path.dirname(PROJECT_ROOT)
+sys.path.insert(0, PARENT_DIR)
+from host_router import root_agent,host_agent_instance
+routing_agent = root_agent
+host_router = host_agent_instance       # HostRoutingAgent → 可加 debug_callback
+def host_debug_logger(text: str):
+    host_router.debug_runtime_buffer.append(text)
 
-
+host_router.debug_callback = host_debug_logger
 APP_NAME = 'routing_app'
 USER_ID = 'default_user'
 SESSION_ID = 'default_session'
-
 SESSION_SERVICE = InMemorySessionService()
 ROUTING_AGENT_RUNNER = Runner(
     agent=routing_agent,
     app_name=APP_NAME,
     session_service=SESSION_SERVICE,
+    plugins=[FunctionCallLogPlugin(name="function_call_logger")],
 )
-LOG_PATH = "/mnt/ssd2/dh/Agent/logs/session_trace.log"
-LOGPATH = "/mnt/ssd2/dh/Agent/logs/prompt_debug.log"
-os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
-def log_json(obj, header=""):
-    """简单的 JSON 打印/记录函数"""
-    import json, os
-    os.makedirs(os.path.dirname(LOGPATH), exist_ok=True)
-    with open(LOGPATH, "a", encoding="utf-8") as f:
-        f.write(f"\n=== {header} @ {datetime.datetime.now().isoformat()} ===\n")
-        try:
-            import dataclasses
-            if hasattr(obj, "model_dump"):
-                f.write(json.dumps(obj.model_dump(exclude_none=True), indent=2, ensure_ascii=False))
-            else:
-                f.write(json.dumps(obj, indent=2, ensure_ascii=False))
-        except Exception:
-            f.write(str(obj))
-        f.write("\n------------------------------------\n")
-
-def log_event(user_message: str, event_obj: object):
-    """记录单个事件到日志文件"""
-    try:
-        timestamp = datetime.now().isoformat()
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(f"\n=== New Event @ {timestamp} ===\n")
-            f.write(f"User Message: {user_message}\n")
-            if event_obj:
-                try:
-                    json_data = event_obj.model_dump(exclude_none=True)
-                except Exception:
-                    json_data = str(event_obj)
-                f.write(json.dumps(json_data, indent=2, ensure_ascii=False))
-                f.write("\n---------------------------------------\n")
-    except Exception as e:
-        print(f"[LOG ERROR] Failed to write event log: {e}")
-
-"""
+import json, os, time, datetime, traceback
+from pprint import pformat
+import gradio as gr
+from typing import AsyncIterator
+from google.genai import types
+from google.adk.events import Event
 async def get_response_from_agent(
     message: str,
-    history: list[gr.ChatMessage],
-) -> AsyncIterator[gr.ChatMessage]:
+    history: list[ChatMessage],
+):
+    """Get response from host agent."""
+    messages_buffer = []  # Buffer to accumulate all messages
+    agent_call_id2messages_idx_map = {}  # Map agent_call_id to message index
+
     try:
-        print(f"[DEBUG] Runner.run_async() called with message: {message}")
-        ctx = await SESSION_SERVICE.get_session(app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_ID)
-        prompt_text = routing_agent.instruction(ctx)
-        log_json({"system_prompt": prompt_text, "user_message": message}, header="MODEL PROMPT")
         event_iterator: AsyncIterator[Event] = ROUTING_AGENT_RUNNER.run_async(
-            user_id=USER_ID,    
+            user_id=USER_ID,
             session_id=SESSION_ID,
             new_message=types.Content(
                 role='user', parts=[types.Part(text=message)]
             ),
         )
-
         async for event in event_iterator:
-            log_event(message, event)
-            log_json(event, header="MODEL RESPONSE EVENT")
             if event.content and event.content.parts:
                 for part in event.content.parts:
                     if part.function_call:
+
+                        # 🔥 改成 keyword
+                        keyword = part.function_call.args.get('keyword', 'unknown_keyword')
+                        agent_call_id = part.function_call.id
+                        
                         formatted_call = f'```python\n{pformat(part.function_call.model_dump(exclude_none=True), indent=2, width=80)}\n```'
-                        yield gr.ChatMessage(
-                            role='assistant',
-                            content=f'🛠️ **Tool Call: {part.function_call.name}**\n{formatted_call}',
+                        
+                        # 创建新消息,显示正在调用的 task(keyword)
+                        new_message = ChatMessage(
+                            content=f'🤔 **Calling {keyword}**\n{formatted_call}',
+                            metadata={"title": f"⏳ {keyword}", "id": agent_call_id, "status": "pending"}
                         )
+                        
+                        messages_buffer.append(new_message)
+                        agent_call_id2messages_idx_map[agent_call_id] = len(messages_buffer) - 1
+                        
+                        # 立即 yield 以显示思考过程
+                        yield messages_buffer
+                        
                     elif part.function_response:
-                        response_content = part.function_response.response
-                        if (
-                            isinstance(response_content, dict)
-                            and 'response' in response_content
-                        ):
-                            formatted_response_data = response_content[
-                                'response'
-                            ]
-                        else:
-                            formatted_response_data = response_content
-                        formatted_response = f'```json\n{pformat(formatted_response_data, indent=2, width=80)}\n```'
-                        yield gr.ChatMessage(
-                            role='assistant',
-                            content=f'⚡ **Tool Response from {part.function_response.name}**\n{formatted_response}',
-                        )
+
+                        agent_call_id = part.function_response.id
+
+                        if agent_call_id in agent_call_id2messages_idx_map:
+
+                            idx = agent_call_id2messages_idx_map[agent_call_id]
+                            old_message = messages_buffer[idx]
+
+                            # keyword 替代 agent_name
+                            keyword = old_message.metadata.get("title", "task").replace("⏳", "").strip()
+
+                            # 标记完成
+                            old_message.metadata["title"] = f"✅ {keyword}"
+                            old_message.metadata["status"] = "done"
+
+                            # --- 解析 payload ---
+                            response_raw = part.function_response.response
+                            if isinstance(response_raw, dict) and response_raw.get("type") == "multi_agent_response":
+                                payload = response_raw["payload"]
+                            else:
+                                try:
+                                    payload = json.loads(response_raw)
+                                except:
+                                    payload = {}
+
+                            agent_list_queue = payload.get("agent_list_queue", [])
+                            connection_queue = payload.get("connection_queue", [])
+                            agent_responses = payload.get("agent_responses", {})
+                            debug_queue = payload.get("debug_queue", [])
+
+                            # =============== 将所有内容追加到旧消息气泡中 ===============
+
+                            block = []
+                            block.append(f"\n\n### 🧩 子任务结果 — `{keyword}`\n")
+
+                            # --- 注册中心 ---
+                            block.append("#### 📄 注册中心返回的 Agent 列表\n")
+                            block.append("```json\n")
+                            for lst in agent_list_queue:
+                                block.append(json.dumps(lst, ensure_ascii=False, indent=2) + "\n")
+                            block.append("```\n")
+
+                            # --- 连接情况 ---
+                            block.append("#### 🔌 代理连接情况\n")
+                            block.append("```text\n")
+                            for conn in connection_queue:
+                                block.append(f"{conn['agent']} -> {conn['status']} ({conn['url']})\n")
+                            block.append("```\n")
+
+                            # --- Debug 信息 ---
+                            if debug_queue:
+                                block.append("#### 📋 Debug 信息\n")
+                                block.append("```text\n")
+                                for dbg in debug_queue:
+                                    block.append(dbg + "\n")
+                                block.append("```\n")
+
+                            # --- 子 Agent 回复内容 ---
+                            block.append("#### 🤖 子 Agent 回复\n")
+                            for agent_name, content in agent_responses.items():
+                                block.append(f"\n##### {agent_name}\n")
+                                if isinstance(content, str):
+                                    block.append(content.strip() + "\n")
+                                else:
+                                    block.append("```json\n")
+                                    block.append(json.dumps(content, ensure_ascii=False, indent=2))
+                                    block.append("\n```\n")
+                            # 追加到原消息内容
+                            old_message.content += "".join(block)
+                            # 立即刷新 UI
+                            yield messages_buffer
             if event.is_final_response():
                 final_response_text = ''
                 if event.content and event.content.parts:
@@ -118,126 +172,22 @@ async def get_response_from_agent(
                 elif event.actions and event.actions.escalate:
                     final_response_text = f'Agent escalated: {event.error_message or "No specific message."}'
                 if final_response_text:
-                    yield gr.ChatMessage(
+                    new_message = gr.ChatMessage(
                         role='assistant', content=final_response_text
                     )
+                    messages_buffer.append(new_message)
+                    # Yield all accumulated messages including the final one
+                    yield messages_buffer
                 break
     except Exception as e:
         print(f'Error in get_response_from_agent (Type: {type(e)}): {e}')
         traceback.print_exc()  # This will print the full traceback
-        yield gr.ChatMessage(
+        error_message = gr.ChatMessage(
             role='assistant',
             content='An error occurred while processing your request. Please check the server logs for details.',
         )
-"""
-import json, os, time, datetime, traceback
-from pprint import pformat
-import gradio as gr
-from typing import AsyncIterator
-from google.genai import types
-from google.adk.events import Event
-
-LOG_DIR = "./logs"
-os.makedirs(LOG_DIR, exist_ok=True)
-SESSION_LOG = os.path.join(LOG_DIR, f"session_{datetime.date.today()}.log")
-
-def write_log(data: dict, header: str = None):
-    """Append structured data to daily log file."""
-    with open(SESSION_LOG, "a", encoding="utf-8") as f:
-        f.write("\n" + "=" * 100 + "\n")
-        if header:
-            f.write(f"=== {header} @ {datetime.datetime.now()} ===\n")
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        f.write("\n" + "=" * 100 + "\n")
-
-async def get_response_from_agent(
-    message: str,
-    history: list[gr.ChatMessage],
-) -> AsyncIterator[gr.ChatMessage]:
-    """Get response from host agent and log full runtime info."""
-
-    start_time = time.time()
-    runtime_record = {
-        "timestamp": datetime.datetime.now().isoformat(),
-        "user_message": message,
-        "events": [],
-        "final_response": None,
-        "error": None,
-    }
-
-    try:
-        print(f"[DEBUG] Runner.run_async() called with message: {message}")
-        ctx = await SESSION_SERVICE.get_session(
-            app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_ID
-        )
-        prompt_text = routing_agent.instruction(ctx)
-        write_log({"system_prompt": prompt_text, "user_message": message}, "MODEL PROMPT")
-
-        event_iterator: AsyncIterator[Event] = ROUTING_AGENT_RUNNER.run_async(
-            user_id=USER_ID,
-            session_id=SESSION_ID,
-            new_message=types.Content(role="user", parts=[types.Part(text=message)]),
-        )
-
-        async for event in event_iterator:
-            # --- 记录事件
-            runtime_record["events"].append({
-                "time": time.time(),
-                "event_type": event.type if hasattr(event, "type") else "unknown",
-                "content": str(event.content)[:300] if event.content else None,
-            })
-            log_json(event, header="MODEL RESPONSE EVENT")
-
-            if event.content and event.content.parts:
-                for part in event.content.parts:
-                    if part.function_call:
-                        formatted_call = f"```python\n{pformat(part.function_call.model_dump(exclude_none=True), indent=2, width=80)}\n```"
-                        yield gr.ChatMessage(
-                            role="assistant",
-                            content=f"🛠️ **Tool Call: {part.function_call.name}**\n{formatted_call}",
-                        )
-
-                    elif part.function_response:
-                        response_content = part.function_response.response
-                        if isinstance(response_content, dict) and "response" in response_content:
-                            formatted_response_data = response_content["response"]
-                        else:
-                            formatted_response_data = response_content
-                        formatted_response = f"```json\n{pformat(formatted_response_data, indent=2, width=80)}\n```"
-                        yield gr.ChatMessage(
-                            role="assistant",
-                            content=f"⚡ **Tool Response from {part.function_response.name}**\n{formatted_response}",
-                        )
-
-            # --- 最终响应阶段
-            if event.is_final_response():
-                final_response_text = ""
-                if event.content and event.content.parts:
-                    final_response_text = "".join(
-                        [p.text for p in event.content.parts if p.text]
-                    )
-                elif event.actions and event.actions.escalate:
-                    final_response_text = f"Agent escalated: {event.error_message or 'No specific message.'}"
-
-                runtime_record["final_response"] = final_response_text
-                if final_response_text:
-                    yield gr.ChatMessage(role="assistant", content=final_response_text)
-                break
-
-    except Exception as e:
-        runtime_record["error"] = str(e)
-        print(f"❌ Error in get_response_from_agent (Type: {type(e)}): {e}")
-        traceback.print_exc()
-        yield gr.ChatMessage(
-            role="assistant",
-            content="An error occurred while processing your request. Please check the server logs for details.",
-        )
-
-    finally:
-        runtime_record["duration_sec"] = round(time.time() - start_time, 3)
-        runtime_record["status"] = "completed" if not runtime_record["error"] else "error"
-        write_log(runtime_record, "SESSION SUMMARY")
-
+        messages_buffer.append(error_message)
+        yield messages_buffer
 async def main():
     """Main gradio app."""
     print('Creating ADK session...')
@@ -247,28 +197,27 @@ async def main():
     print('ADK session created successfully.')
 
     with gr.Blocks(
-        theme=gr.themes.Ocean(), title='A2A Host Agent with Logo'
+        title='A2A DEMO',
+        css="""
+        #component-0 {
+            height: 90vh;
+        }
+        """
     ) as demo:
-        gr.Image(
-            '../assets/a2a-logo-black.svg',
-            width=100,
-            height=100,
-            scale=0,
-            show_label=False,
-            show_download_button=False,
-            container=False,
-            show_fullscreen_button=False,
-        )
         gr.ChatInterface(
             get_response_from_agent,
             title='A2A Host Agent',
-            description='This assistant can help you to check weather and find airbnb accommodation',
+            description='This assistant can help you to check weather, find airbnb accommodation, and search TripAdvisor for attractions and restaurants',
+            type='messages',
+
         )
 
     print('Launching Gradio interface...')
     demo.queue().launch(
-        server_name='0.0.0.0',
+        server_name='127.0.0.1',
         server_port=8083,
+        share=False,
+        prevent_thread_lock=False,
     )
     print('Gradio application has been shut down.')
 

@@ -15,8 +15,8 @@ class RegistryAgentItem(BaseModel):
     agent_id: str
     name: str
     description: Optional[str] = None
-    url: str
-    version: float
+    url: Optional[str] = None
+    version: str
 
 
 class RegistryListResp(BaseModel):
